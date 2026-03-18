@@ -34,7 +34,7 @@ BASE_URL = _env_str("BASE_URL", "https://cdn.moltyroyale.com/api")
 WALLET_ADDRESS = _env_str("WALLET_ADDRESS", "0xxxxxxxxxxxxxxxxxxxx")
 
 PREFERRED_GAME_TYPE = _env_str("PREFERRED_GAME_TYPE", "free")
-AUTO_CREATE_GAME = _env_bool("AUTO_CREATE_GAME", "true")
+AUTO_CREATE_GAME = _env_bool("AUTO_CREATE_GAME", "false")
 GAME_MAP_SIZE = _env_str("GAME_MAP_SIZE", "medium")
 
 HP_CRITICAL = _env_int("HP_CRITICAL", 65)
