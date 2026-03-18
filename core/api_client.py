@@ -4,12 +4,21 @@ MOLTY ROYALE BOT - API CLIENT
 ==============================================================================
 Handles all HTTP communication with the Molty Royale API.
 Includes retry logic, error handling, and rate limiting.
+
+FIXES vs original:
+  [FIX-1] All endpoint methods used ["data"] directly → KeyError crash if
+          server omits "data" key. Now uses _extract_data() helper which
+          tries "data" first, then falls back to the root response dict,
+          so bot never crashes on unexpected response shapes.
+  [FIX-2] get_state() and register_agent_fast() had no fallback either.
+  [FIX-3] Added DEBUG logging when fallback path is used, so it's visible
+          in logs if server changes its response structure.
 """
 
 import time
 import logging
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger("MoltyBot.API")
 
@@ -21,6 +30,29 @@ class APIError(Exception):
         super().__init__(f"[{code}] {message}")
 
 
+# [FIX-1] ─────────────────────────────────────────────────────────────────────
+def _extract_data(response: Dict, endpoint: str = "") -> Dict:
+    """
+    Safely extract the payload from an API response.
+
+    Tries in order:
+      1. response["data"]          ← standard Molty API shape
+      2. response["result"]        ← some endpoints use this key
+      3. response (root)           ← data is at root level
+
+    Logs a DEBUG warning if we had to fall back so it shows up in logs.
+    """
+    if "data" in response:
+        return response["data"]
+    if "result" in response and isinstance(response["result"], dict):
+        logger.debug(f"[API] '{endpoint}' returned 'result' instead of 'data' — using it")
+        return response["result"]
+    # Last resort: the whole response is the payload
+    logger.debug(f"[API] '{endpoint}' has no 'data' key — using root response as payload")
+    return response
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class APIClient:
     """
     Thread-safe API client for Molty Royale.
@@ -29,13 +61,13 @@ class APIClient:
 
     def __init__(self, base_url: str, api_key: str):
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.session = requests.Session()
+        self.api_key  = api_key
+        self.session  = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "X-API-Key": api_key
+            "X-API-Key"   : api_key
         })
-        self._request_count = 0
+        self._request_count    = 0
         self._last_request_time = 0.0
 
     # -------------------------------------------------------------------------
@@ -45,29 +77,26 @@ class APIClient:
     def _request(self, method: str, path: str, max_retries: int = 3,
                  retry_delay: float = 2.0, timeout: int = 10, **kwargs) -> Dict[str, Any]:
         """Execute HTTP request with retry logic and error handling."""
-        url = f"{self.base_url}{path}"
+        url        = f"{self.base_url}{path}"
         last_error = None
 
         for attempt in range(max_retries):
             try:
-                # Minimal rate limiting: 100ms between requests
                 elapsed = time.time() - self._last_request_time
                 if elapsed < 0.1:
                     time.sleep(0.1 - elapsed)
 
                 response = self.session.request(method, url, timeout=timeout, **kwargs)
                 self._last_request_time = time.time()
-                self._request_count += 1
+                self._request_count    += 1
 
                 data = response.json()
 
-                # API-level error (success: false)
                 if not data.get("success", True):
                     error = data.get("error", {})
-                    code = error.get("code", "UNKNOWN")
-                    msg = error.get("message", "Unknown API error")
+                    code  = error.get("code", "UNKNOWN")
+                    msg   = error.get("message", "Unknown API error")
 
-                    # Non-retryable errors
                     non_retryable = {
                         "AGENT_NOT_FOUND", "GAME_NOT_FOUND", "GAME_ALREADY_STARTED",
                         "ACCOUNT_ALREADY_IN_GAME", "ONE_AGENT_PER_API_KEY",
@@ -90,7 +119,6 @@ class APIClient:
                 raise
             except requests.exceptions.Timeout:
                 last_error = APIError("Request timeout", "TIMEOUT")
-                # Hanya WARNING di retry terakhir, retry awal cukup DEBUG
                 if attempt >= max_retries - 1:
                     logger.warning(f"Timeout on {path} (final attempt {attempt+1}/{max_retries})")
                 else:
@@ -128,45 +156,53 @@ class APIClient:
         payload = {}
         if name:
             payload["name"] = name
-        return self.post("/accounts", json=payload)["data"]
+        return _extract_data(self.post("/accounts", json=payload), "/accounts")
 
     def get_account(self) -> Dict:
         """Get current account info including active games."""
-        return self.get("/accounts/me")["data"]
+        return _extract_data(self.get("/accounts/me"), "/accounts/me")
 
     def set_wallet(self, wallet_address: str) -> Dict:
         """Register EVM wallet for rewards."""
-        return self.put("/accounts/wallet", json={"wallet_address": wallet_address})["data"]
+        return _extract_data(
+            self.put("/accounts/wallet", json={"wallet_address": wallet_address}),
+            "/accounts/wallet"
+        )
 
     def get_history(self, limit: int = 50) -> list:
         """Get transaction history."""
-        return self.get(f"/accounts/history?limit={limit}").get("data", [])
+        resp = self.get(f"/accounts/history?limit={limit}")
+        return _extract_data(resp, "/accounts/history") if isinstance(
+            resp.get("data"), list) else resp.get("data", [])
 
     # -------------------------------------------------------------------------
     # GAME ENDPOINTS
     # -------------------------------------------------------------------------
 
     def list_games(self, status: str = "waiting") -> list:
-        """List games by status. Gunakan timeout pendek agar tidak blocking lama."""
+        """List games by status."""
         try:
-            # timeout=8 → max retry 3x = max 24s, bukan 45s seperti timeout=15
-            return self.get(f"/games?status={status}", timeout=8).get("data", [])
+            resp = self.get(f"/games?status={status}", timeout=8)
+            result = _extract_data(resp, "/games")
+            return result if isinstance(result, list) else resp.get("data", [])
         except (APIError, Exception):
             return []
 
     def list_games_fast(self, status: str = "waiting") -> list:
         """Fast version: 1 attempt, 3s timeout. Untuk sniping room."""
         try:
-            return self._request(
+            resp = self._request(
                 "GET", f"/games?status={status}",
                 max_retries=1, timeout=3, retry_delay=0
-            ).get("data", [])
+            )
+            result = _extract_data(resp, "/games")
+            return result if isinstance(result, list) else resp.get("data", [])
         except Exception:
             return []
 
     def get_game(self, game_id: str) -> Dict:
         """Get game info."""
-        return self.get(f"/games/{game_id}")["data"]
+        return _extract_data(self.get(f"/games/{game_id}"), f"/games/{game_id}")
 
     def create_game(self, host_name: str = None, map_size: str = "medium",
                     entry_type: str = "free", max_agents: int = None) -> Dict:
@@ -176,22 +212,28 @@ class APIClient:
             payload["hostName"] = host_name
         if max_agents:
             payload["maxAgents"] = max_agents
-        return self.post("/games", json=payload)["data"]
+        return _extract_data(self.post("/games", json=payload), "/games")
 
     def register_agent(self, game_id: str, agent_name: str) -> Dict:
-        """Register agent in a game. API key in header gives 10 $Moltz."""
-        return self.post(
-            f"/games/{game_id}/agents/register",
-            json={"name": agent_name}
-        )["data"]
+        """Register agent in a game."""
+        return _extract_data(
+            self.post(
+                f"/games/{game_id}/agents/register",
+                json={"name": agent_name}
+            ),
+            f"/games/{game_id}/agents/register"
+        )
 
     def register_agent_fast(self, game_id: str, agent_name: str) -> Dict:
         """Fast version: 1 attempt, 5s timeout. Untuk sniping room."""
-        return self._request(
-            "POST", f"/games/{game_id}/agents/register",
-            max_retries=1, timeout=5, retry_delay=0,
-            json={"name": agent_name}
-        )["data"]
+        return _extract_data(
+            self._request(
+                "POST", f"/games/{game_id}/agents/register",
+                max_retries=1, timeout=5, retry_delay=0,
+                json={"name": agent_name}
+            ),
+            f"/games/{game_id}/agents/register"
+        )
 
     # -------------------------------------------------------------------------
     # AGENT ENDPOINTS
@@ -199,7 +241,10 @@ class APIClient:
 
     def get_state(self, game_id: str, agent_id: str) -> Dict:
         """Get agent's current full state. Call every turn."""
-        return self.get(f"/games/{game_id}/agents/{agent_id}/state")["data"]
+        return _extract_data(
+            self.get(f"/games/{game_id}/agents/{agent_id}/state"),
+            f"/games/{game_id}/agents/{agent_id}/state"
+        )
 
     def take_action(self, game_id: str, agent_id: str,
                     action: Dict, thought: Dict = None) -> Dict:
